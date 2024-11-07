@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html lang='en' class=''>
+<head>
+  <meta charset='UTF-8'>
+</head>
+<body>
+  <div class="popup-container"></div>
+  <script>
+    setTimeout(() => {
+      document.querySelector(".popup-container").textContent = "Hello!";
+    }, ((Math.random() * 5) + 2) * 1000);
+  </script>
+</body>
+</html>
