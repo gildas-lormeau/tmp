@@ -7,7 +7,9 @@
   <div class="popup-container"></div>
   <script>
     setTimeout(() => {
-      document.querySelector(".popup-container").textContent = "Hello!";
+      const popupElement = document.createElement("div");
+      popupElement.textContent = "Hello!";
+      document.querySelector(".popup-container").appendChild(popupElement);
     }, ((Math.random() * 5) + 2) * 1000);
   </script>
 </body>
