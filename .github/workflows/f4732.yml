@@ -13,7 +13,7 @@ env:
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     defaults:
       run:
         shell: pwsh
@@ -62,36 +62,16 @@ jobs:
             Start-Sleep 2
           }
           '@ | Set-Content cap.ps1
-      - name: Install MSIX Firefox (per user)
-        timeout-minutes: 10
-        run: |
-          $out = winget install --id Mozilla.Firefox --exact --scope user --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | Select-Object -Last 1
-          "WINGET exit=$LASTEXITCODE :: $out"
-          $pkg = Get-AppxPackage -Name *Firefox* | Select-Object -First 1
-          "appx: $($pkg.Name) $($pkg.Version) $($pkg.InstallLocation)"
-          $exe = (Get-ChildItem $pkg.InstallLocation -Recurse -Filter firefox.exe -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
-          "package exe: $exe"
-          $ini = Join-Path (Split-Path $exe) "application.ini"
-          if (Test-Path $ini) { Get-Content $ini | Select-String "^Version|^BuildID" }
-          "machine-wide: $((Get-Item 'C:\Program Files\Mozilla Firefox\firefox.exe').VersionInfo.ProductVersion)"
-          "EXE=$exe" | Out-File -Append $env:GITHUB_ENV
-          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          exit 0
-      - name: A - MSIX package exe (fails on demand)
+      - name: B - machine-wide Firefox, fresh profile, 30 runs
         run: |
           . .\cap.ps1
-          Cap "pkg-exe-1" @("https://example.com", "out.html", "--browser-engine", "firefox", "--browser-executable-path", $env:EXE)
-          Cap "pkg-exe-2" @("https://example.com", "out.html", "--browser-engine", "firefox", "--browser-executable-path", $env:EXE)
-          exit 0
-      - name: B - machine-wide Firefox, fresh profile, 8 runs
-        run: |
-          . .\cap.ps1
-          foreach ($i in 1..8) { Cap "machine-$i" @("https://example.com", "out.html", "--browser-engine", "firefox", "--browser-executable-path", "C:\Program Files\Mozilla Firefox\firefox.exe") }
-          exit 0
-      - name: C - MSIX alias (control)
-        run: |
-          . .\cap.ps1
-          Cap "alias" @("https://example.com", "out.html", "--browser-engine", "firefox", "--browser-executable-path", "$env:LOCALAPPDATA\Microsoft\WindowsApps\firefox.exe")
+          $fails = 0
+          foreach ($i in 1..30) {
+            $r = Cap "machine-$i" @("https://example.com", "out.html", "--browser-engine", "firefox", "--browser-executable-path", "C:\Program Files\Mozilla Firefox\firefox.exe")
+            $r
+            if (($r | Select-String "^EXIT=" | Out-String) -notmatch "EXIT=0 ") { $fails++ }
+          }
+          "FAILURES=$fails of 30"
           exit 0
       - uses: actions/upload-artifact@v4
         if: always()
