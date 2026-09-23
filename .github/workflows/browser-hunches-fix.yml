@@ -66,8 +66,13 @@ jobs:
       - name: Chrome and Edge keep --single-process
         run: |
           . .\cap.ps1
+          $edge = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
           Cap "chrome default" @("https://example.com", "out.html")
-          Cap "edge default" @("https://example.com", "out.html", "--browser-executable-path", "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
+          foreach ($i in 1..3) {
+            Cap "edge default $i" @("https://example.com", "out.html", "--browser-executable-path", $edge)
+            Cap "edge no-single-process $i" @("https://example.com", "out.html", "--browser-executable-path", $edge, "--browser-single-process", "false")
+          }
+          Cap "edge default via node" @("https://example.com", "out.html", "--browser-executable-path", $edge) "node"
           exit 0
       - name: Install MSIX Firefox, Brave and Vivaldi (per user)
         timeout-minutes: 15
