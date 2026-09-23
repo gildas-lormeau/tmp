@@ -1,0 +1,135 @@
+name: browser-hunches2
+
+on:
+  push:
+    paths:
+      - .github/workflows/browser-hunches2.yml
+  workflow_dispatch:
+
+env:
+  CLI_SHA: 53fa747
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: CLI
+        run: |
+          git clone -q https://github.com/gildas-lormeau/single-file-cli.git cli
+          git -C cli checkout -q $env:CLI_SHA
+          git -C cli log --oneline -1
+          deno cache cli\single-file *> $null; "deno cache exit=$LASTEXITCODE"
+          @'
+          function Cap($name, [string[]]$cliArgs, $limit = 150) {
+            "===== $name"
+            Remove-Item out.html, log.txt -ErrorAction SilentlyContinue
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $job = Start-Job -ScriptBlock { param($dir, $a) Set-Location $dir; & deno run -A cli\single-file @a *> log.txt; $LASTEXITCODE } -ArgumentList (Get-Location).Path, $cliArgs
+            $seen = @{}
+            while (-not [bool](Wait-Job $job -Timeout 1)) {
+              Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue | Where-Object { "$($_.CommandLine)" -match "remote-debugging-port" -and "$($_.CommandLine)" -notmatch "--type=" } | ForEach-Object {
+                $seen["pid=$($_.ProcessId) single-process=$("$($_.CommandLine)" -match '--single-process') path=$($_.ExecutablePath)"] = 1
+              }
+              if ($sw.Elapsed.TotalSeconds -gt $limit) { Stop-Job $job; break }
+            }
+            $code = if ($job.State -eq "Completed") { Receive-Job $job } else { "TIMEOUT" }
+            $size = if (Test-Path out.html) { (Get-Item out.html).Length } else { "none" }
+            $warnings = if (Test-Path log.txt) { @(Select-String -Path log.txt -Pattern "retrying without it").Count } else { 0 }
+            "EXIT=$code secs=$([math]::Round($sw.Elapsed.TotalSeconds, 1)) size=$size relaunch_warnings=$warnings"
+            $seen.Keys | ForEach-Object { "  main process: $_" }
+            if (Test-Path log.txt) { Get-Content log.txt | Select-Object -Last 6 }
+            Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep 2
+          }
+          '@ | Set-Content cap.ps1
+      - name: 9d8b8 - Firefox versions per channel
+        run: |
+          winget show --id Mozilla.Firefox --exact --accept-source-agreements 2>&1 | Select-String -Pattern "^Version|Installer Type|Scope" | Select-Object -First 6
+          "---- winget, per-user scope"
+          winget show --id Mozilla.Firefox --exact --scope user 2>&1 | Select-String -Pattern "^Version|Installer Type|Installer Url" | Select-Object -First 6
+          "---- msstore source (9NZVDKPMR9RD)"
+          winget show --id 9NZVDKPMR9RD --source msstore --accept-source-agreements 2>&1 | Select-String -Pattern "^Version|Publisher|Installer Type" | Select-Object -First 6
+          "---- versions listed for Mozilla.Firefox"
+          winget show --id Mozilla.Firefox --exact --versions 2>&1 | Select-Object -First 8
+          exit 0
+      - name: 21e76 - Chromium builds named chrome.exe
+        timeout-minutes: 15
+        run: |
+          . .\cap.ps1
+          Push-Location $env:RUNNER_TEMP
+          npx --yes @puppeteer/browsers install chromium@latest --path "$env:RUNNER_TEMP\pb" 2>&1 | Select-Object -Last 1
+          npx --yes @puppeteer/browsers install chrome@stable --path "$env:RUNNER_TEMP\pb" 2>&1 | Select-Object -Last 1
+          Pop-Location
+          $chromium = (Get-ChildItem "$env:RUNNER_TEMP\pb\chromium" -Recurse -Filter chrome.exe | Select-Object -First 1).FullName
+          $cft = (Get-ChildItem "$env:RUNNER_TEMP\pb\chrome" -Recurse -Filter chrome.exe | Select-Object -First 1).FullName
+          "chromium: $chromium"; "cft: $cft"
+          foreach ($pair in @(@("chromium snapshot", $chromium), @("chrome for testing", $cft))) {
+            foreach ($i in 1..2) {
+              Cap "$($pair[0]) default $i" @("https://example.com", "out.html", "--browser-executable-path", $pair[1])
+            }
+            Cap "$($pair[0]) no-single-process" @("https://example.com", "out.html", "--browser-executable-path", $pair[1], "--browser-single-process", "false")
+          }
+          exit 0
+
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: CLI
+        run: |
+          git clone -q https://github.com/gildas-lormeau/single-file-cli.git cli
+          git -C cli checkout -q $CLI_SHA
+          git -C cli log --oneline -1
+          deno cache cli/single-file > /dev/null 2>&1; echo "cache exit=$?"
+          cat > cap.sh <<'EOF'
+          cap() {
+              name=$1; shift
+              echo "===== $name"
+              rm -f out.html log.txt
+              start=$(date +%s.%N)
+              timeout 150 deno run -A cli/single-file https://example.com out.html "$@" > log.txt 2>&1
+              code=$?
+              echo "EXIT=$code secs=$(echo "$(date +%s.%N) - $start" | bc) size=$(stat -c %s out.html 2>/dev/null || echo none)"
+              tail -4 log.txt
+              pkill -f org.mozilla.firefox 2>/dev/null
+              sleep 2
+          }
+          EOF
+      - name: 20e65 - Flatpak Firefox, user override and user install
+        timeout-minutes: 25
+        run: |
+          set +e
+          . ./cap.sh
+          sudo apt-get update -q > /dev/null && sudo apt-get install -y -q flatpak > /dev/null; echo "apt exit=$?"
+          echo "#### system install, --user override"
+          sudo flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          sudo flatpak install -y --noninteractive flathub org.mozilla.firefox > /dev/null 2>&1; echo "system install exit=$?"
+          SYS=/var/lib/flatpak/exports/bin/org.mozilla.firefox
+          cap "system, no override (negative)" --browser-engine firefox --browser-executable-path $SYS
+          flatpak override --user --filesystem=/tmp org.mozilla.firefox; echo "user override exit=$?"
+          flatpak override --user --show org.mozilla.firefox
+          cap "system, --user override" --browser-engine firefox --browser-executable-path $SYS
+          flatpak override --user --reset org.mozilla.firefox
+          echo "#### per-user install"
+          sudo flatpak uninstall -y --noninteractive org.mozilla.firefox > /dev/null 2>&1; echo "system uninstall exit=$?"
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive flathub org.mozilla.firefox > /dev/null 2>&1; echo "user install exit=$?"
+          USR=$HOME/.local/share/flatpak/exports/bin/org.mozilla.firefox
+          ls -la $USR; ls -la $SYS 2>&1 | head -1
+          cap "user install, no override (negative)" --browser-engine firefox --browser-executable-path $USR
+          flatpak override --user --filesystem=/tmp org.mozilla.firefox
+          cap "user install, --user override" --browser-engine firefox --browser-executable-path $USR
+          exit 0
