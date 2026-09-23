@@ -1,0 +1,91 @@
+name: vivaldi-probe
+
+on:
+  push:
+    paths:
+      - .github/workflows/vivaldi-probe.yml
+      - vivaldi-probe/**
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: CLI
+        run: |
+          git clone -q --depth 1 https://github.com/gildas-lormeau/single-file-cli.git cli
+          git -C cli log --oneline -1
+          deno cache cli/single-file > /dev/null 2>&1; echo "cache exit=$?"
+      - name: Install Vivaldi (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $out = winget install --id Vivaldi.Vivaldi --exact --scope user --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | Select-Object -Last 1
+          "WINGET exit=$LASTEXITCODE :: $out"
+          "VIVALDI=$env:LOCALAPPDATA\Vivaldi\Application\vivaldi.exe" | Out-File -Append $env:GITHUB_ENV
+          "CHROME=C:\Program Files\Google\Chrome\Application\chrome.exe" | Out-File -Append $env:GITHUB_ENV
+      - name: Install Vivaldi (linux)
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: |
+          curl -fsSL https://repo.vivaldi.com/archive/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/vivaldi.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/vivaldi.gpg] https://repo.vivaldi.com/archive/deb/ stable main" | sudo tee /etc/apt/sources.list.d/vivaldi.list > /dev/null
+          sudo apt-get update -qq > /dev/null 2>&1
+          sudo apt-get install -y -qq vivaldi-stable > /dev/null 2>&1; echo "apt exit=$?"
+          echo "VIVALDI=$(command -v vivaldi || command -v vivaldi-stable)" >> "$GITHUB_ENV"
+          echo "CHROME=$(command -v google-chrome)" >> "$GITHUB_ENV"
+      - name: Install Vivaldi (macos)
+        if: runner.os == 'macOS'
+        timeout-minutes: 10
+        run: |
+          brew install --cask vivaldi > /dev/null 2>&1; echo "brew exit=$?"
+          echo "VIVALDI=/Applications/Vivaldi.app/Contents/MacOS/Vivaldi" >> "$GITHUB_ENV"
+          echo "CHROME=/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" >> "$GITHUB_ENV"
+      - name: Versions
+        run: |
+          ls -la "$VIVALDI" "$CHROME" || true
+      - name: Probe Chrome (positive control)
+        timeout-minutes: 5
+        run: deno run -A vivaldi-probe/probe.ts "$CHROME" cli-headless
+      - name: Probe Vivaldi, CDP step by step
+        timeout-minutes: 25
+        run: |
+          WRAP=""
+          if [ "$RUNNER_OS" = "Linux" ]; then WRAP="xvfb-run -a"; fi
+          for variant in cli-headless cli-headless-single cli-headless-no-bwsi cli-headless-no-startup-window-kept cli-headless-useragent minimal-headless; do
+            deno run -A vivaldi-probe/probe.ts "$VIVALDI" "$variant"
+          done
+          for variant in cli-headful cli-headful-single; do
+            $WRAP deno run -A vivaldi-probe/probe.ts "$VIVALDI" "$variant"
+          done
+      - name: CLI with Vivaldi
+        timeout-minutes: 10
+        run: |
+          WRAP=""
+          if [ "$RUNNER_OS" = "Linux" ]; then WRAP="xvfb-run -a"; fi
+          run_cli() {
+            label="$1"; shift
+            rm -f out.html
+            start=$(date +%s)
+            $WRAP deno run -A cli/single-file https://example.com out.html --browser-executable-path "$VIVALDI" --browser-load-max-time 20000 "$@" > log.txt 2>&1
+            code=$?
+            echo "== CLI $label: exit=$code $(( $(date +%s) - start ))s size=$(wc -c < out.html 2>/dev/null || echo none)"
+            tail -c 400 log.txt; echo
+          }
+          run_cli default
+          run_cli user-agent --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+          run_cli no-single-process --browser-single-process false
+          run_cli headful --browser-headless false
