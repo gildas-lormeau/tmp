@@ -60,12 +60,8 @@ jobs:
       - name: Probe Chrome (positive control)
         timeout-minutes: 5
         run: deno run -A vivaldi-probe/probe2.ts "$CHROME" json-new-blank
-      - name: Probe Vivaldi, target creation
-        timeout-minutes: 20
-        run: |
-          for strategy in json-new-blank json-new-nourl json-new-data json-new-blank-wait json-new-blank-navigate-blank json-new-blank-activate target-create target-create-window target-create-foreground; do
-            deno run -A vivaldi-probe/probe2.ts "$VIVALDI" "$strategy"
-          done
+      - name: Patch the CLI (navigate to about:blank first)
+        run: deno run -A vivaldi-probe/patch.ts && git -C cli diff --stat
       - name: CLI with Vivaldi
         timeout-minutes: 10
         run: |
@@ -76,11 +72,13 @@ jobs:
             label="$1"; shift
             rm -f out.html
             start=$(date +%s)
-            $WRAP deno run -A cli/single-file https://example.com out.html --browser-executable-path "$VIVALDI" --browser-load-max-time 20000 "$@" > log.txt 2>&1
+            $WRAP deno run -A cli/single-file https://example.com out.html --browser-executable-path "$VIVALDI" --browser-load-max-time 20000 "$@"
+            grep -o '<title>[^<]*</title>' out.html 2>/dev/null > log.txt 2>&1
             code=$?
             echo "== CLI $label: exit=$code $(( $(date +%s) - start ))s size=$(wc -c < out.html 2>/dev/null || echo none)"
             tail -c 400 log.txt; echo
           }
+          run_cli chrome-control --browser-executable-path "$CHROME"
           run_cli default
           run_cli user-agent --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
           run_cli no-single-process --browser-single-process false
