@@ -1,0 +1,100 @@
+name: f4732
+
+on:
+  push:
+    paths:
+      - .github/workflows/f4732.yml
+      - cli-f4732/**
+  workflow_dispatch:
+
+env:
+  CLI_SHA: fc0ac657cdf7c90d8bb309c112c8506c4d8c4688
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: probe
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: CLI (logging copy)
+        run: |
+          git clone -q https://github.com/gildas-lormeau/single-file-cli.git cli
+          git -C cli checkout -q $env:CLI_SHA
+          Copy-Item probe\cli-f4732\* cli\ -Recurse -Force
+          git -C cli status --short
+          deno cache cli\single-file *> $null; "deno cache exit=$LASTEXITCODE"
+          New-Item -ItemType Directory logs | Out-Null
+          @'
+          function Cap($name, [string[]]$cliArgs, $limit = 120) {
+            "===== $name"
+            $file = "logs\$($name -replace '[^\w-]', '_').txt"
+            Remove-Item out.html -ErrorAction SilentlyContinue
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $job = Start-Job -ScriptBlock { param($dir, $a, $file) Set-Location $dir; & deno run -A cli\single-file @a *> $file; $LASTEXITCODE } -ArgumentList (Get-Location).Path, $cliArgs, $file
+            $seen = [ordered]@{}
+            while (-not [bool](Wait-Job $job -Timeout 1)) {
+              $t = [math]::Round($sw.Elapsed.TotalSeconds, 0)
+              Get-CimInstance Win32_Process -Filter "Name='firefox.exe'" -ErrorAction SilentlyContinue | ForEach-Object {
+                $cl = "$($_.CommandLine)"
+                $kind = if ($cl -match '-contentproc') { "content:" + ($cl -split ' ' | Select-Object -Last 1) } elseif ($cl -match 'remote-debugging-port') { "main" } else { "other[" + $cl.Substring(0, [Math]::Min(80, $cl.Length)) + "]" }
+                $key = "pid=$($_.ProcessId) parent=$($_.ParentProcessId) $kind"
+                if (-not $seen.Contains($key)) { $seen[$key] = "first seen t=${t}s" }
+              }
+              if ($sw.Elapsed.TotalSeconds -gt $limit) { Stop-Job $job; break }
+            }
+            $code = if ($job.State -eq "Completed") { Receive-Job $job } else { "TIMEOUT" }
+            $size = if (Test-Path out.html) { (Get-Item out.html).Length } else { "none" }
+            "EXIT=$code secs=$([math]::Round($sw.Elapsed.TotalSeconds, 1)) size=$size"
+            $seen.Keys | ForEach-Object { "  proc $_ $($seen[$_])" }
+            if ("$code" -ne "0") {
+              "--- BiDi traffic and context/remote lines"
+              Get-Content $file | Select-String -Pattern '<<|>>|Discarded|context|Remote|WebDriver|restart|Error' | Select-Object -First 150 | ForEach-Object { "  " + $_.Line.Substring(0, [Math]::Min(300, $_.Line.Length)) }
+            }
+            Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep 2
+          }
+          '@ | Set-Content cap.ps1
+      - name: Install MSIX Firefox (per user)
+        timeout-minutes: 10
+        run: |
+          $out = winget install --id Mozilla.Firefox --exact --scope user --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | Select-Object -Last 1
+          "WINGET exit=$LASTEXITCODE :: $out"
+          $pkg = Get-AppxPackage -Name *Firefox* | Select-Object -First 1
+          "appx: $($pkg.Name) $($pkg.Version) $($pkg.InstallLocation)"
+          $exe = (Get-ChildItem $pkg.InstallLocation -Recurse -Filter firefox.exe -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+          "package exe: $exe"
+          $ini = Join-Path (Split-Path $exe) "application.ini"
+          if (Test-Path $ini) { Get-Content $ini | Select-String "^Version|^BuildID" }
+          "machine-wide: $((Get-Item 'C:\Program Files\Mozilla Firefox\firefox.exe').VersionInfo.ProductVersion)"
+          "EXE=$exe" | Out-File -Append $env:GITHUB_ENV
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          exit 0
+      - name: A - MSIX package exe (fails on demand)
+        run: |
+          . .\cap.ps1
+          Cap "pkg-exe-1" @("https://example.com", "out.html", "--browser-engine", "firefox", "--browser-executable-path", $env:EXE)
+          Cap "pkg-exe-2" @("https://example.com", "out.html", "--browser-engine", "firefox", "--browser-executable-path", $env:EXE)
+          exit 0
+      - name: B - machine-wide Firefox, fresh profile, 8 runs
+        run: |
+          . .\cap.ps1
+          foreach ($i in 1..8) { Cap "machine-$i" @("https://example.com", "out.html", "--browser-engine", "firefox", "--browser-executable-path", "C:\Program Files\Mozilla Firefox\firefox.exe") }
+          exit 0
+      - name: C - MSIX alias (control)
+        run: |
+          . .\cap.ps1
+          Cap "alias" @("https://example.com", "out.html", "--browser-engine", "firefox", "--browser-executable-path", "$env:LOCALAPPDATA\Microsoft\WindowsApps\firefox.exe")
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: f4732-logs
+          path: logs
