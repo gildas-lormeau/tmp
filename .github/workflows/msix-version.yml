@@ -1,0 +1,33 @@
+name: msix-version
+
+on:
+  push:
+    paths:
+      - .github/workflows/msix-version.yml
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Install MSIX Firefox (per user) and read its version
+        timeout-minutes: 12
+        run: |
+          [Console]::OutputEncoding = [Text.UTF8Encoding]::new()
+          $out = winget install --id Mozilla.Firefox --exact --scope user --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | Select-Object -Last 1
+          "WINGET exit=$LASTEXITCODE :: $out"
+          winget show --id Mozilla.Firefox --exact --scope user 2>&1 | Select-String -Pattern "Version|Installer Type|Installer Url"
+          $pkg = Get-AppxPackage -Name *Firefox* | Select-Object -First 1
+          "appx: $($pkg.Name) $($pkg.Version)"
+          $exe = (Get-ChildItem $pkg.InstallLocation -Recurse -Filter firefox.exe -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+          "file version: $((Get-Item $exe).VersionInfo.ProductVersion)"
+          Get-Content (Join-Path (Split-Path $exe) "application.ini") | Select-String "^Version|^BuildID"
+          $alias = "$env:LOCALAPPDATA\Microsoft\WindowsApps\firefox.exe"
+          "alias --version: $(& $alias --version 2>&1 | Out-String)"
+          "---- upgrade available?"
+          winget upgrade --id Mozilla.Firefox --exact --accept-source-agreements 2>&1 | Select-Object -Last 3
+          exit 0
