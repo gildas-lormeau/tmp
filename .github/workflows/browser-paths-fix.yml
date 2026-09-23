@@ -1,0 +1,157 @@
+name: browser-paths-fix
+
+on:
+  push:
+    paths:
+      - .github/workflows/browser-paths-fix.yml
+      - cli-patch/**
+  workflow_dispatch:
+
+env:
+  CLI_VERSION: v2.15.6
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Patched CLI from source
+        run: |
+          git clone -q --depth 1 --branch "$CLI_VERSION" https://github.com/gildas-lormeau/single-file-cli.git cli
+          cp cli-patch/*.js cli/lib/
+          cd cli && git status --short
+          grep -oE '"/[^"]+"' lib/constants.js | tr -d '"' | grep -v '^/Applications' | sort -u > ../listed.txt
+          deno cache single-file > /dev/null 2>&1; echo "cache exit=$?"
+      - name: Baseline
+        timeout-minutes: 5
+        run: |
+          set +e
+          run_cli() { name=$1; shift; rm -f out.html; start=$(date +%s); deno run -A cli/single-file https://example.com out.html "$@" > log.txt 2>&1; code=$?; echo "RESULT [$name] exit=$code time=$(( $(date +%s) - start ))s size=$(stat -c %s out.html 2>/dev/null || echo none) log=$(head -c 300 log.txt | tr '\n' ' ')"; }
+          run_cli chromium-default
+          run_cli firefox-default --browser-engine firefox
+          true
+      - name: Install snap chromium
+        timeout-minutes: 8
+        run: sudo snap install chromium
+      - name: Hide every listed path except snap chromium
+        run: |
+          while read -r p; do if [ "$p" != /snap/bin/chromium ] && { [ -e "$p" ] || [ -L "$p" ]; }; then echo "HIDING $p"; sudo mv "$p" "$p.hidden"; fi; done < listed.txt
+      - name: Snap chromium found by default, Firefox reported missing
+        timeout-minutes: 5
+        run: |
+          set +e
+          run_cli() { name=$1; shift; rm -f out.html; start=$(date +%s); deno run -A cli/single-file https://example.com out.html "$@" > log.txt 2>&1; code=$?; echo "RESULT [$name] exit=$code time=$(( $(date +%s) - start ))s size=$(stat -c %s out.html 2>/dev/null || echo none) log=$(head -c 300 log.txt | tr '\n' ' ')"; }
+          run_cli chromium-default-snap
+          run_cli firefox-default-none --browser-engine firefox
+          true
+      - name: Browser only on the PATH
+        timeout-minutes: 5
+        run: |
+          set +e
+          sudo mv /snap/bin/chromium /snap/bin/chromium.hidden
+          sudo ln -s /opt/google/chrome/google-chrome.hidden /usr/local/bin/google-chrome
+          echo "PATH=$PATH"
+          run_cli() { name=$1; shift; rm -f out.html; start=$(date +%s); deno run -A cli/single-file https://example.com out.html "$@" > log.txt 2>&1; code=$?; echo "RESULT [$name] exit=$code time=$(( $(date +%s) - start ))s size=$(stat -c %s out.html 2>/dev/null || echo none) log=$(head -c 300 log.txt | tr '\n' ' ')"; }
+          run_cli chromium-default-path
+          sudo rm /usr/local/bin/google-chrome
+          run_cli chromium-default-none
+          true
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Patched CLI from source
+        run: |
+          git clone -q --depth 1 --branch "$env:CLI_VERSION" https://github.com/gildas-lormeau/single-file-cli.git cli
+          Copy-Item cli-patch\*.js cli\lib\ -Force
+          git -C cli status --short
+          $listed = [regex]::Matches((Get-Content cli\lib\constants.js -Raw), '"(C:\\\\[^"]+)"') | ForEach-Object { $_.Groups[1].Value -replace '\\\\', '\' } | Sort-Object -Unique
+          $listed | Set-Content listed.txt
+          deno cache cli\single-file *> $null; "cache exit=$LASTEXITCODE"
+      - name: Define runner
+        run: |
+          @'
+          function Run-Cli($name, [string[]]$extra) {
+            Remove-Item out.html -ErrorAction SilentlyContinue
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            $job = Start-Job -ScriptBlock { param($dir, $extra) Set-Location $dir; & deno run -A cli\single-file https://example.com out.html @extra *> log.txt; $LASTEXITCODE } -ArgumentList (Get-Location).Path, $extra
+            if (Wait-Job $job -Timeout 120) { $code = Receive-Job $job } else { $code = "TIMEOUT"; Stop-Job $job; Get-Process chrome, msedge, brave, vivaldi, opera, browser, firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
+            $size = if (Test-Path out.html) { (Get-Item out.html).Length } else { "none" }
+            $log = if (Test-Path log.txt) { (Get-Content log.txt -Raw) -replace "`r?`n", " " } else { "" }
+            if ($log.Length -gt 300) { $log = $log.Substring(0, 300) }
+            "RESULT [$name] exit=$code time=$([int]$watch.Elapsed.TotalSeconds)s size=$size log=$log"
+          }
+          '@ | Set-Content run-cli.ps1
+      - name: Baseline
+        run: |
+          . .\run-cli.ps1
+          Run-Cli chromium-default @()
+          Run-Cli firefox-default @("--browser-engine", "firefox")
+          exit 0
+      - name: Hide every listed path, then time the not-found error
+        run: |
+          foreach ($p in Get-Content listed.txt) { if (Test-Path $p) { try { Move-Item $p "$p.hidden" -Force -ErrorAction Stop; "HIDING $p" } catch { "HIDE FAILED $p :: $_" } } }
+          . .\run-cli.ps1
+          Run-Cli chromium-default-none @()
+          Run-Cli firefox-default-none @("--browser-engine", "firefox")
+          exit 0
+      - name: Per-user installs
+        timeout-minutes: 15
+        run: |
+          foreach ($id in 'Google.Chrome.Canary', 'Brave.Brave', 'Opera.Opera', 'Yandex.Browser') {
+            $out = winget install --id $id --exact --scope user --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | Select-Object -Last 1
+            "WINGET $id exit=$LASTEXITCODE :: $out"
+          }
+          Invoke-WebRequest "https://download.mozilla.org/?product=firefox-latest&os=win64&lang=en-US" -OutFile firefox-setup.exe
+          $target = Join-Path $env:LOCALAPPDATA "Mozilla Firefox"
+          Start-Process .\firefox-setup.exe -ArgumentList "/S", "/InstallDirectoryPath=$target" -Wait
+          "FIREFOX installed: $(Test-Path (Join-Path $target 'firefox.exe'))"
+          exit 0
+      - name: Per-user installs found by default
+        run: |
+          . .\run-cli.ps1
+          Run-Cli chromium-default-user @()
+          Run-Cli firefox-default-user @("--browser-engine", "firefox")
+          foreach ($p in "$env:LOCALAPPDATA\Google\Chrome SxS\Application\chrome.exe", "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe", "$env:LOCALAPPDATA\Programs\Opera\opera.exe", "$env:LOCALAPPDATA\Yandex\YandexBrowser\Application\browser.exe") {
+            if (Test-Path $p) { Run-Cli "explicit $p" @("--browser-executable-path", $p) } else { "MISSING $p" }
+          }
+          exit 0
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Patched CLI from source
+        run: |
+          git clone -q --depth 1 --branch "$CLI_VERSION" https://github.com/gildas-lormeau/single-file-cli.git cli
+          cp cli-patch/*.js cli/lib/
+          grep -oE '"/Applications/[^"]+\.app/' cli/lib/constants.js | sed 's/^"//; s/\/$//' | sort -u > apps.txt
+          deno cache cli/single-file > /dev/null 2>&1; echo "cache exit=$?"
+      - name: Move every listed app to ~/Applications
+        run: |
+          mkdir -p ~/Applications
+          while read -r a; do if [ -d "$a" ]; then echo "MOVING $a"; sudo mv "$a" ~/Applications/; fi; done < apps.txt
+      - name: Apps in ~/Applications found by default
+        timeout-minutes: 5
+        run: |
+          set +e
+          run_cli() { name=$1; shift; rm -f out.html; start=$(date +%s); deno run -A cli/single-file https://example.com out.html "$@" > log.txt 2>&1; code=$?; echo "RESULT [$name] exit=$code time=$(( $(date +%s) - start ))s size=$(stat -f %z out.html 2>/dev/null || echo none) log=$(head -c 300 log.txt | tr '\n' ' ')"; }
+          run_cli chromium-default-home
+          run_cli firefox-default-home --browser-engine firefox
+          true
