@@ -1,0 +1,1041 @@
+/*
+ * Copyright 2010-2025 Gildas Lormeau
+ * contact : gildas.lormeau <at> gmail.com
+ * 
+ * This file is part of SingleFile.
+ *
+ *   The code in this file is free software: you can redistribute it and/or 
+ *   modify it under the terms of the GNU Affero General Public License 
+ *   (GNU AGPL) as published by the Free Software Foundation, either version 3
+ *   of the License, or (at your option) any later version.
+ * 
+ *   The code in this file is distributed in the hope that it will be useful, 
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of 
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero 
+ *   General Public License for more details.
+ *
+ *   As additional permission under GNU AGPL version 3 section 7, you may 
+ *   distribute UNMODIFIED VERSIONS OF THIS file without the copy of the GNU 
+ *   AGPL normally required by section 4, provided you include this license 
+ *   notice and a URL through which recipients can access the Corresponding 
+ *   Source.
+ */
+
+/* global setTimeout, clearTimeout, URL, AbortController */
+
+import {
+	launchChromium,
+	getChromiumOptions,
+	closeChromium,
+	chromiumExited,
+	chromiumSingleProcess
+} from "./chromium.js";
+import {
+	CDP,
+	options as cdpOptions
+} from "simple-cdp";
+import {
+	FETCH_FUNCTION_NAME,
+	RESOLVE_FETCH_FUNCTION_NAME,
+	REJECT_FETCH_FUNCTION_NAME,
+	SCRIPT_READY_PROPERTY_NAME,
+	SCRIPT_ERROR_PROPERTY_NAME,
+	getScriptSource,
+	getHookScriptSource,
+	getPageDataScriptSource
+} from "./single-file-script.js";
+import {
+	fetch,
+	waitForTimeout,
+	arrayBufferToBase64,
+	getAlternativeUrl,
+	getReferer,
+	getDocumentReferrerPolicy,
+	getDocumentHeaderReferrerPolicy
+} from "./cdp-client-util.js";
+
+const LOAD_TIMEOUT_ERROR = "ERR_LOAD_TIMEOUT";
+const CAPTURE_TIMEOUT_ERROR = "ERR_CAPTURE_TIMEOUT";
+const SETUP_TIMEOUT_ERROR = "ERR_SETUP_TIMEOUT";
+const UNREACHABLE_URL_ERROR = "ERR_UNREACHABLE_URL";
+const NETWORK_STATES = ["InteractiveTime", "networkIdle", "networkAlmostIdle", "load", "DOMContentLoaded"];
+const MINIMIZED_WINDOW_STATE = "minimized";
+const SINGLE_FILE_WORLD_NAME = "singlefile";
+const CAPTURE_SCREENSHOT_FUNCTION_NAME = "captureScreenshot";
+const PRINT_TO_PDF_FUNCTION_NAME = "printToPDF";
+const SET_SCREENSHOT_FUNCTION_NAME = "setScreenshot";
+const SET_PDF_FUNCTION_NAME = "setPDF";
+const SET_PAGE_DATA_FUNCTION_NAME = "setPageData";
+const BINDING_CALLED_EVENT_TYPE = "bindingCalled";
+const LOCALHOST = "http://localhost:";
+const HEADLESS_USER_AGENT_TOKEN = "Headless";
+const BROWSER_EXITED_MAX_DELAY = 2000;
+const CORS_SAFELISTED_HEADER_NAMES = ["accept", "accept-language", "content-language"];
+const CORS_UNSAFE_HEADER_VALUE = /[^\t\x20-\x7e]|[():<>?@[\\\]{}]/;
+const CORS_SAFELISTED_HEADER_VALUE_MAX_LENGTH = 128;
+const SERVICE_WORKER_TARGET_TYPE = "service_worker";
+const USER_AGENT_HEADER_NAME = "user-agent";
+const REFERER_HEADER_NAME = "referer";
+
+let browserOptions, relaunchBrowserPromise;
+
+export {
+	initialize,
+	getPageData,
+	closeChromium as closeBrowser
+};
+
+async function initialize(singleFileOptions) {
+	if (singleFileOptions.browserServer) {
+		cdpOptions.apiUrl = singleFileOptions.browserServer;
+	} else {
+		browserOptions = getChromiumOptions(singleFileOptions);
+		cdpOptions.apiUrl = LOCALHOST + (await launchChromium(browserOptions));
+	}
+}
+
+function relaunchBrowser() {
+	if (!relaunchBrowserPromise) {
+		console.warn("Warning: the browser exited when using --browser-single-process, retrying without it"); // eslint-disable-line no-console
+		relaunchBrowserPromise = (async () => {
+			await closeChromium();
+			browserOptions.singleProcess = false;
+			cdpOptions.apiUrl = LOCALHOST + (await launchChromium(browserOptions));
+		})();
+	}
+	return relaunchBrowserPromise;
+}
+
+async function getPageData(options) {
+	const EMPTY_PAGE_URL = "about:blank";
+	// compiled here so that an invalid pattern is reported before the page is
+	// loaded, instead of throwing for every request that is intercepted
+	const blockedURLPatterns = (options.blockedURLPatterns || []).map(pattern => new RegExp(pattern));
+	const pageContext = { options, consoleMessages: [], debugMessages: [], httpInfo: {}, documentInfo: {}, browserInfo: {}, blockedURLPatterns, fetchAbortController: new AbortController() };
+	let targetInfo, cdp;
+	try {
+		logData(["Loading page", EMPTY_PAGE_URL], pageContext);
+		await withinSetupMaxTime(async () => {
+			targetInfo = await CDP.createTarget(EMPTY_PAGE_URL);
+			cdp = new CDP(targetInfo);
+			await setupConsoleLogging(cdp, pageContext);
+			await setupBrowserWindow(cdp, targetInfo.id, pageContext);
+			await setupSecurity(cdp, pageContext);
+			await setupDeviceEmulation(cdp, pageContext);
+			await setupNetwork(cdp, pageContext);
+			await setupDownloadBehavior(cdp);
+			await setupScriptInjection(cdp, pageContext);
+			await setupDialogHandling(cdp, pageContext);
+		}, options);
+		const contextId = await getContextId(cdp, pageContext);
+		const pageDataPromise = setupPageDataCapture(cdp, pageContext);
+		await setupBindings(cdp, pageContext);
+		await capturePageData(cdp, contextId, pageContext);
+		await disableCdpDomains(cdp, pageContext);
+		return await finalizePageData(pageDataPromise, pageContext);
+	} catch (error) {
+		if (await shouldRelaunchBrowser()) {
+			return await relaunchBrowserAndRetry();
+		}
+		attachDebugInfo(error, pageContext);
+		throw error;
+	} finally {
+		logData(["Closing page"], pageContext);
+		pageContext.fetchAbortController.abort();
+		await closeTarget();
+		logData(["Finishing"], pageContext);
+	}
+
+	async function shouldRelaunchBrowser() {
+		return chromiumSingleProcess() && await chromiumExited(BROWSER_EXITED_MAX_DELAY);
+	}
+
+	async function relaunchBrowserAndRetry() {
+		logData(["Relaunching the browser"], pageContext);
+		targetInfo = null;
+		if (cdp) {
+			cdp.reset();
+			cdp = null;
+		}
+		await relaunchBrowser();
+		return await getPageData(options);
+	}
+
+	async function closeTarget() {
+		if (targetInfo && !options.browserDebug) {
+			try {
+				await CDP.closeTarget(targetInfo.id);
+			} catch {
+				// ignored
+			}
+			targetInfo = null;
+		}
+		// the connection is closed even when the target is left open for
+		// debugging, otherwise it stays open until the process exits
+		if (cdp) {
+			cdp.reset();
+			cdp = null;
+		}
+	}
+}
+
+async function setupConsoleLogging({ Console }, { options, consoleMessages, debugMessages }) {
+	const CONSOLE_MESSAGE_ADDED_EVENT_TYPE = "messageAdded";
+	if (options.consoleMessagesFile) {
+		logData(["Enabling console messages"], { options, debugMessages });
+		await Console.enable();
+		Console.addEventListener(CONSOLE_MESSAGE_ADDED_EVENT_TYPE, ({ params }) => {
+			consoleMessages.push(params.message);
+		});
+	}
+}
+
+async function setupBrowserWindow({ Browser }, targetId, { options, debugMessages }) {
+	if (options.browserStartMinimized) {
+		const { windowId, bounds } = await Browser.getWindowForTarget({ targetId });
+		if (bounds.windowState !== MINIMIZED_WINDOW_STATE) {
+			logData(["Minimizing window"], { options, debugMessages });
+			await Browser.setWindowBounds({ windowId, bounds: { windowState: MINIMIZED_WINDOW_STATE } });
+		}
+	}
+}
+
+async function setupSecurity({ Security }, { options, debugMessages }, sessionId) {
+	if (options.browserIgnoreHTTPSErrors !== undefined && options.browserIgnoreHTTPSErrors) {
+		logData(["Ignoring HTTPS errors"], { options, debugMessages });
+		await Security.setIgnoreCertificateErrors({ ignore: true }, sessionId);
+	}
+}
+
+async function setupDeviceEmulation({ Browser, Emulation, Runtime }, { options, debugMessages, browserInfo }) {
+	const needsDeviceMetrics = options.browserMobileEmulation || options.browserDeviceWidth ||
+		options.browserDeviceHeight || options.browserDeviceScaleFactor;
+	if (needsDeviceMetrics) {
+		await setupDeviceMetrics({ Emulation, Runtime }, { options, debugMessages });
+	}
+	if (options.emulateMediaFeatures) {
+		await setupMediaFeatures({ Emulation }, { options, debugMessages });
+	}
+	// kept so that the resources fetched outside the browser present the same
+	// identity as the browser itself
+	browserInfo.userAgent = await setupUserAgent({ Browser, Emulation }, { options, debugMessages });
+}
+
+function needsUserAgentOverride(options) {
+	return Boolean(options.browserMobileEmulation || options.platform || options.acceptLanguage);
+}
+
+async function setupDeviceMetrics({ Emulation, Runtime }, { options, debugMessages }) {
+	const INNER_WIDTH_PROPERTY = "window.innerWidth";
+	const INNER_HEIGHT_PROPERTY = "window.innerHeight";
+	const DEVICE_PIXEL_RATIO_PROPERTY = "window.devicePixelRatio";
+	const browserDeviceWidth = options.browserDeviceWidth ||
+		(await Runtime.evaluate({ expression: INNER_WIDTH_PROPERTY })).result.value;
+	const browserDeviceHeight = options.browserDeviceHeight ||
+		(await Runtime.evaluate({ expression: INNER_HEIGHT_PROPERTY })).result.value;
+	const browserDeviceScaleFactor = options.browserDeviceScaleFactor ||
+		(await Runtime.evaluate({ expression: DEVICE_PIXEL_RATIO_PROPERTY })).result.value;
+	const deviceMetricsOptions = {
+		mobile: Boolean(options.browserMobileEmulation),
+		width: options.browserDeviceWidth || (options.browserMobileEmulation ? 360 : options.width || browserDeviceWidth),
+		height: options.browserDeviceHeight || (options.browserMobileEmulation ? 800 : options.height || browserDeviceHeight),
+		deviceScaleFactor: options.browserDeviceScaleFactor || (options.browserMobileEmulation ? 2 : browserDeviceScaleFactor)
+	};
+	logData(["Emulating device metrics", JSON.stringify(deviceMetricsOptions)], { options, debugMessages });
+	await Emulation.setDeviceMetricsOverride(deviceMetricsOptions);
+}
+
+async function setupUserAgent({ Browser, Emulation }, { options, debugMessages }, sessionId) {
+	const ANDROID_PLATFORM = "Android";
+	const { userAgent, product } = await Browser.getVersion();
+	const defaultMobileUA = `Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) ${removeHeadlessToken(product)} Mobile Safari/537.36`;
+	const agentOptions = {
+		userAgent: options.userAgent || (options.browserMobileEmulation ? defaultMobileUA : removeHeadlessToken(userAgent))
+	};
+	if (options.acceptLanguage) {
+		agentOptions.acceptLanguage = options.acceptLanguage;
+	}
+	if (options.platform || options.browserMobileEmulation) {
+		agentOptions.platform = options.platform || ANDROID_PLATFORM;
+	}
+	if (needsUserAgentOverride(options) || agentOptions.userAgent !== userAgent) {
+		logData(["Emulating user agent", JSON.stringify(agentOptions)], { options, debugMessages });
+		await Emulation.setUserAgentOverride(agentOptions, sessionId);
+	}
+	return agentOptions.userAgent;
+}
+
+function removeHeadlessToken(userAgent) {
+	return userAgent.replace(HEADLESS_USER_AGENT_TOKEN, "");
+}
+
+async function setupNetwork({ Fetch, Network }, { options, debugMessages, httpInfo, documentInfo, blockedURLPatterns }) {
+	const { handleAuthRequests, patterns } = getInterceptionOptions(options);
+	await Fetch.enable({ handleAuthRequests, patterns });
+	if (handleAuthRequests) {
+		setupProxyAuth({ Fetch }, { options, debugMessages });
+	}
+	setupRequestInterception({ Fetch }, { options, debugMessages, httpInfo, documentInfo, blockedURLPatterns });
+	if (options.httpHeaders && !hasUnsafeHttpHeaders(options)) {
+		await setupHttpHeaders({ Network }, { options, debugMessages });
+	}
+	if (options.browserCookies && options.browserCookies.length) {
+		await setupCookies({ Network }, { options, debugMessages });
+	}
+}
+
+async function setupDownloadBehavior({ Browser }) {
+	const DENY_BEHAVIOR = "deny";
+	await Browser.setDownloadBehavior({ behavior: DENY_BEHAVIOR });
+}
+
+function getInterceptionOptions(options) {
+	const REQUEST_STAGE = "Request";
+	const RESPONSE_STAGE = "Response";
+	const handleAuthRequests = Boolean(options.httpProxyUsername);
+	// a request paused on the response stage has already been sent and answered,
+	// so a blocked URL is only left uncontacted when the request stage is asked for
+	const patterns = handleAuthRequests || hasUnsafeHttpHeaders(options) || hasBlockedURLPatterns(options) ?
+		[{ requestStage: REQUEST_STAGE }, { requestStage: RESPONSE_STAGE }] :
+		[{ requestStage: RESPONSE_STAGE }];
+	return { handleAuthRequests, patterns };
+}
+
+function hasBlockedURLPatterns(options) {
+	return Boolean(options.blockedURLPatterns && options.blockedURLPatterns.length);
+}
+
+// headers set on the network layer are part of the CORS decision: one that is not
+// safelisted makes every cross-origin fetch of the page send a preflight, and the
+// servers that do not answer preflights lose the resource to the backend fetch.
+// Such headers are injected on the paused request instead, below that decision
+function hasUnsafeHttpHeaders(options) {
+	return Boolean(options.httpHeaders) &&
+		Object.entries(options.httpHeaders).some(([name, value]) => !isSafelistedHeader(name, value));
+}
+
+function isSafelistedHeader(name, value) {
+	return CORS_SAFELISTED_HEADER_NAMES.includes(name.toLowerCase()) &&
+		value.length <= CORS_SAFELISTED_HEADER_VALUE_MAX_LENGTH &&
+		!CORS_UNSAFE_HEADER_VALUE.test(value);
+}
+
+function setupProxyAuth({ Fetch }, { options, debugMessages }) {
+	const AUTH_REQUIRED_EVENT_TYPE = "authRequired";
+	const PROVIDE_CREDENTIALS_RESPONSE = "ProvideCredentials";
+	Fetch.addEventListener(AUTH_REQUIRED_EVENT_TYPE, ignoringErrors(async ({ params, sessionId }) => {
+		logData(["Authenticating"], { options, debugMessages });
+		await Fetch.continueWithAuth({
+			requestId: params.requestId,
+			authChallengeResponse: {
+				response: PROVIDE_CREDENTIALS_RESPONSE,
+				username: options.httpProxyUsername,
+				password: options.httpProxyPassword
+			}
+		}, sessionId);
+	}, { options, debugMessages }));
+}
+
+function setupRequestInterception({ Fetch }, { options, debugMessages, httpInfo, documentInfo, blockedURLPatterns }) {
+	const REQUEST_PAUSED_EVENT_TYPE = "requestPaused";
+	const ABORTED_ERROR_REASON = "Aborted";
+	const urlState = { url: options.url, alternativeUrl: getAlternativeUrl(options.url) };
+	const injectedHeaders = hasUnsafeHttpHeaders(options) ? options.httpHeaders : undefined;
+	Fetch.addEventListener(REQUEST_PAUSED_EVENT_TYPE, ignoringErrors(async ({ params, sessionId }) => {
+		const { requestId, request, responseStatusCode, responseErrorReason } = params;
+		// the request pauses twice when both stages are intercepted, and the
+		// headers can only be replaced on the first pause
+		const requestStage = responseStatusCode === undefined && responseErrorReason === undefined;
+		// the request is always resumed below, otherwise the page waits for it
+		// until the load timeout expires
+		let blocked = false;
+		try {
+			if (!sessionId) {
+				captureHttpInfo(params, urlState, { options, debugMessages, httpInfo, documentInfo });
+			}
+			blocked = shouldBlockRequest(request.url);
+		} catch (error) {
+			logData(["Ignoring request interception error", error.message], { options, debugMessages });
+		}
+		if (blocked) {
+			try {
+				await Fetch.failRequest({ requestId, errorReason: ABORTED_ERROR_REASON }, sessionId);
+				return;
+			} catch {
+				// ignored
+			}
+		}
+		try {
+			const headers = requestStage && injectedHeaders ? getMergedHeaders(request.headers, injectedHeaders) : undefined;
+			await Fetch.continueRequest(headers ? { requestId, headers } : { requestId }, sessionId);
+		} catch {
+			// ignored
+		}
+	}, { options, debugMessages }));
+
+	function shouldBlockRequest(requestUrl) {
+		const blockedURL = blockedURLPatterns.some(pattern => pattern.test(requestUrl));
+		if (blockedURL) {
+			logData(["Blocking request", requestUrl], { options, debugMessages });
+			return true;
+		}
+		return false;
+	}
+}
+
+// continueRequest replaces the headers of the request instead of adding to them,
+// so the ones the browser prepared are kept and the extra ones merged into them
+function getMergedHeaders(requestHeaders, extraHeaders) {
+	const headers = new Map();
+	Object.entries(requestHeaders).forEach(([name, value]) => headers.set(name.toLowerCase(), { name, value }));
+	Object.entries(extraHeaders).forEach(([name, value]) => headers.set(name.toLowerCase(), { name, value }));
+	return Array.from(headers.values());
+}
+
+function captureHttpInfo(params, urlState, { options, debugMessages, httpInfo, documentInfo }) {
+	const REDIRECT_STATUS_CODES = [301, 302, 303, 307, 308];
+	const DOCUMENT_RESOURCE_TYPE = "Document";
+	const LOCATION_HEADER_NAME = "location";
+	const { request, resourceType, responseHeaders, responseStatusCode, responseStatusText } = params;
+	const isDocument = resourceType === DOCUMENT_RESOURCE_TYPE &&
+		responseStatusCode !== undefined &&
+		(request.url === urlState.url || request.url === urlState.alternativeUrl);
+	if (isDocument) {
+		if (REDIRECT_STATUS_CODES.includes(responseStatusCode)) {
+			const redirect = responseHeaders.find(header => header.name.toLowerCase() === LOCATION_HEADER_NAME)?.value;
+			if (redirect) {
+				urlState.url = new URL(redirect, urlState.url).href;
+			}
+			logData(["Redirecting", urlState.url], { options, debugMessages });
+		} else {
+			// the referrer policy of the document is needed for every capture, the rest of the
+			// information below only when it is written to the JSON output
+			if (!documentInfo.url) {
+				Object.assign(documentInfo, {
+					url: request.url,
+					referrerPolicy: getDocumentHeaderReferrerPolicy(responseHeaders)
+				});
+			}
+			if ((options.outputJson || options.dumpJson) && !httpInfo.request) {
+				Object.assign(httpInfo, {
+					request: {
+						url: request.url,
+						method: request.method,
+						headers: request.headers,
+						referrerPolicy: request.referrerPolicy
+					},
+					resourceType,
+					response: {
+						status: responseStatusCode,
+						statusText: responseStatusText,
+						headers: responseHeaders
+					}
+				});
+			}
+		}
+	}
+}
+
+async function setupHttpHeaders({ Network }, { options, debugMessages }, sessionId) {
+	logData(["Setting HTTP headers", JSON.stringify(options.httpHeaders)], { options, debugMessages });
+	await Network.enable({}, sessionId);
+	await Network.setExtraHTTPHeaders({ headers: options.httpHeaders }, sessionId);
+}
+
+async function setupMediaFeatures({ Emulation }, { options, debugMessages }, sessionId) {
+	const features = [];
+	for (const mediaFeature of options.emulateMediaFeatures) {
+		logData(["Emulating media feature", mediaFeature.name, mediaFeature.value], { options, debugMessages });
+		for (const value of mediaFeature.value.split(",")) {
+			features.push({ name: mediaFeature.name, value: value.trim() });
+		}
+	}
+	await Emulation.setEmulatedMedia({ features }, sessionId);
+}
+
+async function setupCookies({ Network }, { options, debugMessages }) {
+	logData(["Setting cookies", JSON.stringify(options.browserCookies)], { options, debugMessages });
+	await Network.setCookies({ cookies: options.browserCookies });
+}
+
+async function setupScriptInjection(cdp, { options, debugMessages }) {
+	const { Page } = cdp;
+	const scriptSource = await getScriptSource(options);
+	await Page.addScriptToEvaluateOnNewDocument({
+		source: getHookScriptSource(),
+		runImmediately: true
+	});
+	await Page.addScriptToEvaluateOnNewDocument({
+		source: scriptSource,
+		runImmediately: true,
+		worldName: SINGLE_FILE_WORLD_NAME
+	});
+	await setupFrameScriptInjection(cdp, scriptSource, { options, debugMessages });
+}
+
+// out-of-process frames and service workers are separate targets, so neither the
+// scripts registered above nor the network options reach them; they are attached
+// paused, set up and resumed instead
+async function setupFrameScriptInjection(cdp, scriptSource, { options, debugMessages }) {
+	const { Page, Runtime, Target } = cdp;
+	const ATTACHED_TO_TARGET_EVENT_TYPE = "attachedToTarget";
+	const IFRAME_TARGET_TYPE = "iframe";
+	const autoAttachOptions = { autoAttach: true, waitForDebuggerOnStart: true, flatten: true };
+	Target.addEventListener(ATTACHED_TO_TARGET_EVENT_TYPE, ignoringErrors(async ({ params }) => {
+		const { sessionId, targetInfo, waitingForDebugger } = params;
+		try {
+			if (targetInfo.type === SERVICE_WORKER_TARGET_TYPE) {
+				logData(["Applying network options to service worker", targetInfo.url], { options, debugMessages });
+				// the requests a worker makes on behalf of the page are answered
+				// for by its own target, and it is attached paused, so the options
+				// are in place before it can serve a single one
+				await setupNetworkSession(cdp, sessionId, { options, debugMessages });
+			} else if (targetInfo.type === IFRAME_TARGET_TYPE) {
+				logData(["Injecting scripts into frame", targetInfo.url], { options, debugMessages });
+				// the scripts registered below only run when the Page domain is
+				// enabled on the session
+				await Page.enable({}, sessionId);
+				await Target.setAutoAttach(autoAttachOptions, sessionId);
+				await Page.addScriptToEvaluateOnNewDocument({
+					source: getHookScriptSource(),
+					runImmediately: true
+				}, sessionId);
+				await Page.addScriptToEvaluateOnNewDocument({
+					source: scriptSource,
+					runImmediately: true,
+					worldName: SINGLE_FILE_WORLD_NAME
+				}, sessionId);
+				await Runtime.addBinding({ name: FETCH_FUNCTION_NAME, executionContextName: SINGLE_FILE_WORLD_NAME }, sessionId);
+				await setupFrameSession(cdp, sessionId, { options, debugMessages });
+			}
+		} finally {
+			// the target is always resumed, even when a setup command fails,
+			// otherwise it would stay paused until the load timeout expires
+			if (waitingForDebugger) {
+				await Runtime.runIfWaitingForDebugger({}, sessionId);
+			}
+		}
+	}, { options, debugMessages }));
+	await Target.setAutoAttach(autoAttachOptions);
+}
+
+async function setupNetworkSession({ Fetch, Network }, sessionId, { options, debugMessages }) {
+	const { handleAuthRequests, patterns } = getInterceptionOptions(options);
+	if (handleAuthRequests || hasUnsafeHttpHeaders(options) || hasBlockedURLPatterns(options)) {
+		// the requestPaused and authRequired listeners are registered once on
+		// the connection and receive the events of every session
+		await Fetch.enable({ handleAuthRequests, patterns }, sessionId);
+	}
+	if (options.httpHeaders && !hasUnsafeHttpHeaders(options)) {
+		await setupHttpHeaders({ Network }, { options, debugMessages }, sessionId);
+	}
+}
+
+async function setupFrameSession({ Browser, Emulation, Fetch, Network, Security }, sessionId, { options, debugMessages }) {
+	await setupNetworkSession({ Fetch, Network }, sessionId, { options, debugMessages });
+	await setupSecurity({ Security }, { options, debugMessages }, sessionId);
+	if (options.emulateMediaFeatures) {
+		await setupMediaFeatures({ Emulation }, { options, debugMessages }, sessionId);
+	}
+	await setupUserAgent({ Browser, Emulation }, { options, debugMessages }, sessionId);
+}
+
+// the renderer waits on a dialog until it is answered, and while it waits every
+// command it handles hangs, so the dialog is dismissed as soon as the browser
+// reports it. The event only arrives while the Page domain is enabled, on the
+// session of the frame that opened the dialog
+async function setupDialogHandling({ Page }, { options, debugMessages }) {
+	const DIALOG_OPENING_EVENT_TYPE = "javascriptDialogOpening";
+	const BEFORE_UNLOAD_DIALOG_TYPE = "beforeunload";
+	await Page.enable();
+	Page.addEventListener(DIALOG_OPENING_EVENT_TYPE, ignoringErrors(async ({ params, sessionId }) => {
+		logData(["Dismissing dialog", params.type, params.message], { options, debugMessages });
+		await Page.handleJavaScriptDialog({ accept: params.type === BEFORE_UNLOAD_DIALOG_TYPE }, sessionId);
+	}, { options, debugMessages }));
+}
+
+async function getContextId({ Debugger, Page, Runtime }, { options, debugMessages }) {
+	const [contextId] = await Promise.all([
+		loadPage({ Page, Runtime }, { options, debugMessages }),
+		options.browserDebug ? waitForDebuggerReady() : Promise.resolve()
+	]);
+	return contextId;
+
+	async function waitForDebuggerReady() {
+		await Debugger.enable();
+		await Debugger.pause();
+		await new Promise(resolve => {
+			const RESUMED_EVENT = "resumed";
+			Debugger.addEventListener(RESUMED_EVENT, onResumed);
+			function onResumed() {
+				Debugger.removeEventListener(RESUMED_EVENT, onResumed);
+				resolve();
+			}
+		});
+	}
+}
+
+async function loadPage({ Page, Runtime }, { options, debugMessages }) {
+	const LOAD_TIMEOUT_ERROR_MESSAGE = "Load timeout";
+	await Runtime.enable();
+	await Page.enable();
+	if (options.browserBypassCSP) {
+		await Page.setBypassCSP({ enabled: true });
+	}
+	await Page.setLifecycleEventsEnabled({ enabled: true });
+	// the ID of the top frame is stable, and it is read before the navigation is
+	// triggered so that no event is missed while the browser answers
+	const { frameTree } = await Page.getFrameTree();
+	const state = { topFrameId: frameTree.frame.id, reachedStateIndex: -1 };
+	const loadTimeoutAbortController = new AbortController();
+	const loadTimeoutAbortSignal = loadTimeoutAbortController.signal;
+	let navigatePromise;
+	try {
+		logData(["Loading page", options.url], { options, debugMessages });
+		const contextIdPromise = getTopFrameContextId({ Page, Runtime }, state, { options, debugMessages });
+		navigatePromise = Page.navigate({ url: options.url });
+		// a page that stopped answering is what brings the load here, so the calls
+		// below would hang for ever without the capture timeout around them
+		const stopLoadingAndGetContextId = async () => {
+			await Page.stopLoading();
+			state.settle();
+			return await contextIdPromise;
+		};
+		const [contextId] = await Promise.race([
+			Promise.all([
+				contextIdPromise,
+				navigatePromise
+			]),
+			waitForTimeout(loadTimeoutAbortSignal, options.browserLoadMaxTime, LOAD_TIMEOUT_ERROR_MESSAGE, LOAD_TIMEOUT_ERROR).catch(async error => {
+				if (options.browserWaitUntilFallback && state.reachedStateIndex >= 0) {
+					const reachedState = NETWORK_STATES[state.reachedStateIndex];
+					logData(["Stopping the page loading, reached state", reachedState], { options, debugMessages });
+					console.warn(`Warning: ${options.url} did not reach ${options.browserWaitUntil} within ${options.browserLoadMaxTime} ms, captured as it was at ${reachedState}`); // eslint-disable-line no-console
+					return [await withinCaptureMaxTime(stopLoadingAndGetContextId, options)];
+				}
+				throw error;
+			})
+		]);
+		// only called when the page loaded, these calls can hang forever on an
+		// unresponsive page and would mask the load timeout error. The Page domain
+		// stays enabled: the dialog listener needs its events until the capture ends
+		await Page.setLifecycleEventsEnabled({ enabled: false });
+		await Runtime.disable();
+		return contextId;
+	} catch (error) {
+		if (error && error.code == UNREACHABLE_URL_ERROR) {
+			const errorText = await getNavigationErrorText(navigatePromise);
+			if (errorText) {
+				error.message += " (" + errorText + ")";
+			}
+		}
+		throw error;
+	} finally {
+		if (!loadTimeoutAbortSignal.aborted) {
+			loadTimeoutAbortController.abort();
+		}
+	}
+}
+
+async function getNavigationErrorText(navigatePromise) {
+	const NAVIGATION_RESULT_MAX_DELAY = 1000;
+	let timeoutId;
+	try {
+		const result = await Promise.race([
+			navigatePromise,
+			new Promise(resolve => timeoutId = setTimeout(resolve, NAVIGATION_RESULT_MAX_DELAY))
+		]);
+		return result && result.errorText;
+	} catch {
+		return undefined;
+	} finally {
+		clearTimeout(timeoutId);
+	}
+}
+
+// the listeners are registered synchronously, before the navigation triggered
+// in parallel by the caller can produce any event
+async function getTopFrameContextId({ Page, Runtime }, state, { options, debugMessages }) {
+	await waitForPageReadyState({ Page }, state, { options, debugMessages });
+	return await getSingleFileContext({ Page, Runtime }, state.topFrameId, { options, debugMessages });
+}
+
+async function waitForPageReadyState({ Page }, state, { options, debugMessages }) {
+	const LIFE_CYCLE_EVENT_TYPE = "lifecycleEvent";
+	const FRAME_NAVIGATED_EVENT_TYPE = "frameNavigated";
+	await new Promise((resolve, reject) => {
+		const timeoutState = { timeoutId: undefined };
+		const cleanup = () => {
+			Page.removeEventListener(LIFE_CYCLE_EVENT_TYPE, onLifecycleEvent);
+			Page.removeEventListener(FRAME_NAVIGATED_EVENT_TYPE, onFrameNavigated);
+		};
+		const onLifecycleEvent = createLifecycleEventHandler(state, timeoutState, resolve, cleanup, { options, debugMessages });
+		const onFrameNavigated = createFrameNavigatedHandler(state, timeoutState, reject, cleanup, { options, debugMessages });
+		state.settle = () => {
+			clearTimeout(timeoutState.timeoutId);
+			cleanup();
+			resolve();
+		};
+		Page.addEventListener(LIFE_CYCLE_EVENT_TYPE, onLifecycleEvent);
+		Page.addEventListener(FRAME_NAVIGATED_EVENT_TYPE, onFrameNavigated);
+	});
+}
+
+function createLifecycleEventHandler(state, timeoutState, resolve, cleanup, { options, debugMessages }) {
+	return ({ params }) => {
+		const { frameId, loaderId, name } = params;
+		// the frame keeps its ID across documents: the events of the blank page,
+		// whose network goes idle while the server has not answered yet, would
+		// satisfy the wait and the page would be captured as soon as it commits
+		if (frameId !== state.topFrameId || loaderId !== state.loaderId) {
+			return;
+		}
+		logData(["Detecting lifecycle event", name], { options, debugMessages });
+		const stateIndex = NETWORK_STATES.indexOf(name);
+		if (stateIndex != -1 && (state.reachedStateIndex == -1 || stateIndex < state.reachedStateIndex)) {
+			state.reachedStateIndex = stateIndex;
+		}
+		const shouldResolve = name === options.browserWaitUntil ||
+			(timeoutState.timeoutId && NETWORK_STATES.indexOf(name) < NETWORK_STATES.indexOf(options.browserWaitUntil));
+		if (shouldResolve) {
+			// the delay is restarted when the page reaches a further state, so
+			// that it is captured once it stopped settling
+			clearTimeout(timeoutState.timeoutId);
+			logData([`Waiting ${options.browserWaitUntilDelay} ms`], { options, debugMessages });
+			timeoutState.timeoutId = setTimeout(() => {
+				logData(["Detecting page ready"], { options, debugMessages });
+				cleanup();
+				resolve();
+			}, options.browserWaitUntilDelay);
+		}
+	};
+};
+
+function createFrameNavigatedHandler(state, timeoutState, reject, cleanup, { options, debugMessages }) {
+	const UNREACHABLE_URL_ERROR_MESSAGE = "Unreachable URL";
+	return ({ params }) => {
+		const { frame } = params;
+		if (!frame.parentId) {
+			if (frame.unreachableUrl) {
+				logData(["Detecting unreachable URL", frame.unreachableUrl], { options, debugMessages });
+				clearTimeout(timeoutState.timeoutId);
+				cleanup();
+				const error = new Error(UNREACHABLE_URL_ERROR_MESSAGE + ": " + frame.unreachableUrl);
+				error.code = UNREACHABLE_URL_ERROR;
+				reject(error);
+			} else {
+				// a new document starts the wait over: the states the previous one
+				// reached and the delay it started say nothing about this one
+				logData(["Detecting navigation", frame.url], { options, debugMessages });
+				clearTimeout(timeoutState.timeoutId);
+				timeoutState.timeoutId = undefined;
+				state.reachedStateIndex = -1;
+				state.loaderId = frame.loaderId;
+			}
+		}
+	};
+}
+
+async function getSingleFileContext({ Page, Runtime }, topFrameId, { options, debugMessages }) {
+	const SINGLE_FILE_DETECTION_TEST = "typeof singlefile !== 'undefined' && globalThis." + SCRIPT_READY_PROPERTY_NAME + " === true";
+	const NO_VALID_CONTEXT_ERROR_MESSAGE = "No valid SingleFile execution context found";
+	logData(["Getting execution context"], { options, debugMessages });
+	// the world already exists, so asking for it by name returns the context the
+	// injected script ran in instead of creating another one
+	const { executionContextId } = await Page.createIsolatedWorld({
+		frameId: topFrameId,
+		worldName: SINGLE_FILE_WORLD_NAME,
+		contentSecurityPolicy: ""
+	});
+	// an empty world is returned when the script could not be injected, so the
+	// context is checked before it is used to capture the page
+	const { result } = await Runtime.evaluate({
+		expression: SINGLE_FILE_DETECTION_TEST,
+		contextId: executionContextId
+	});
+	if (result.value !== true) {
+		throw new Error(NO_VALID_CONTEXT_ERROR_MESSAGE + await getInjectionErrorSuffix(Runtime, executionContextId));
+	}
+	return executionContextId;
+}
+
+async function getInjectionErrorSuffix(Runtime, executionContextId) {
+	const { result } = await Runtime.evaluate({
+		expression: "globalThis." + SCRIPT_ERROR_PROPERTY_NAME,
+		contextId: executionContextId
+	}).catch(() => ({}));
+	return result && result.value ? ": " + result.value : "";
+}
+
+function setupPageDataCapture({ Runtime }, { options, debugMessages }) {
+	return new Promise((resolve, reject) => {
+		let pageDataResponse = "";
+		Runtime.addEventListener(BINDING_CALLED_EVENT_TYPE, ({ params }) => {
+			if (params.name === SET_PAGE_DATA_FUNCTION_NAME) {
+				const { payload } = params;
+				if (payload.length) {
+					pageDataResponse += payload;
+				} else {
+					logData(["Setting page data"], { options, debugMessages });
+					try {
+						const result = JSON.parse(pageDataResponse);
+						if (result.content instanceof Array) {
+							result.content = new Uint8Array(result.content);
+						}
+						resolve(result);
+					} catch (error) {
+						reject(error);
+					}
+				}
+			}
+		});
+	});
+}
+
+async function setupBindings({ Page, Runtime }, { options, debugMessages, documentInfo, browserInfo, blockedURLPatterns, fetchAbortController }) {
+	await Runtime.addBinding({ name: SET_PAGE_DATA_FUNCTION_NAME, executionContextName: SINGLE_FILE_WORLD_NAME });
+	if (options.embedScreenshot && options.compressContent) {
+		await setupScreenshotCapture({ Page, Runtime }, { options, debugMessages });
+	}
+	if (options.embedPdf && options.compressContent) {
+		await setupPdfCapture({ Page, Runtime }, { options, debugMessages });
+	}
+	await Runtime.addBinding({ name: FETCH_FUNCTION_NAME, executionContextName: SINGLE_FILE_WORLD_NAME });
+	Runtime.addEventListener(BINDING_CALLED_EVENT_TYPE, ignoringErrors(async ({ params, sessionId }) => {
+		if (params.name === FETCH_FUNCTION_NAME) {
+			await handleFetchRequest({ Runtime }, params, { options, debugMessages, documentInfo, browserInfo, blockedURLPatterns, fetchAbortController }, sessionId);
+		}
+	}, { options, debugMessages }));
+}
+
+async function setupScreenshotCapture({ Page, Runtime }, { options, debugMessages }) {
+	await Runtime.addBinding({ name: CAPTURE_SCREENSHOT_FUNCTION_NAME, executionContextName: SINGLE_FILE_WORLD_NAME });
+	Runtime.addEventListener(BINDING_CALLED_EVENT_TYPE, ignoringErrors(async ({ params }) => {
+		if (params.name === CAPTURE_SCREENSHOT_FUNCTION_NAME) {
+			logData(["Capturing screenshot"], { options, debugMessages });
+			try {
+				const screenshotOptions = parseScreenshotOptions(options.embedScreenshotOptions);
+				const { data } = await Page.captureScreenshot(screenshotOptions);
+				await callBrowserFunction({ Runtime }, params.executionContextId, SET_SCREENSHOT_FUNCTION_NAME, [data]);
+			} catch {
+				await callBrowserFunction({ Runtime }, params.executionContextId, SET_SCREENSHOT_FUNCTION_NAME, [""]);
+			}
+		}
+	}, { options, debugMessages }));
+
+	function parseScreenshotOptions(optionsString) {
+		const PNG_FORMAT = "png";
+		let screenshotOptions = { captureBeyondViewport: true };
+		if (optionsString) {
+			try {
+				screenshotOptions = JSON.parse(optionsString);
+			} catch {
+				// ignored
+			}
+		}
+		screenshotOptions.format = PNG_FORMAT;
+		return screenshotOptions;
+	}
+}
+
+async function setupPdfCapture({ Page, Runtime }, { options, debugMessages }) {
+	await Runtime.addBinding({ name: PRINT_TO_PDF_FUNCTION_NAME, executionContextName: SINGLE_FILE_WORLD_NAME });
+	Runtime.addEventListener(BINDING_CALLED_EVENT_TYPE, ignoringErrors(async ({ params }) => {
+		if (params.name === PRINT_TO_PDF_FUNCTION_NAME) {
+			logData(["Printing to PDF", options.embedPdfOptions || ""], { options, debugMessages });
+			const pdfOptions = parsePdfOptions(options.embedPdfOptions);
+			try {
+				const { data } = await Page.printToPDF(pdfOptions);
+				await callBrowserFunction({ Runtime }, params.executionContextId, SET_PDF_FUNCTION_NAME, [data]);
+			} catch {
+				await callBrowserFunction({ Runtime }, params.executionContextId, SET_PDF_FUNCTION_NAME, [""]);
+			}
+		}
+	}, { options, debugMessages }));
+
+	function parsePdfOptions(optionsString) {
+		let pdfOptions = {};
+		if (optionsString) {
+			try {
+				pdfOptions = JSON.parse(optionsString);
+			} catch {
+				// ignored
+			}
+		}
+		return pdfOptions;
+	}
+}
+
+async function handleFetchRequest({ Runtime }, params, { options, debugMessages, documentInfo, browserInfo, blockedURLPatterns, fetchAbortController }, sessionId) {
+	const BLOCKED_URL_ERROR_MESSAGE = "Blocked URL";
+	const { executionContextId: contextId, payload } = params;
+	const { requestId, url, options: fetchOptions, documentUrl, metaReferrerPolicy } = JSON.parse(payload);
+	logData(["Fetching URL", url], { options, debugMessages });
+	try {
+		// this fetch does not go through the browser, so the URL blocking and
+		// the extra HTTP headers must be applied here too
+		if (blockedURLPatterns.some(pattern => pattern.test(url))) {
+			logData(["Blocking request", url], { options, debugMessages });
+			throw new Error(BLOCKED_URL_ERROR_MESSAGE);
+		}
+		// this fetch runs outside the browser, so without the user agent below it
+		// would reach the server under the runtime's own identity while every
+		// request the browser made presented another one
+		const headers = Object.assign({}, fetchOptions.headers, options.httpHeaders);
+		if (browserInfo.userAgent && !Object.keys(headers).some(name => name.toLowerCase() == USER_AGENT_HEADER_NAME)) {
+			headers[USER_AGENT_HEADER_NAME] = browserInfo.userAgent;
+		}
+		// this fetch runs outside the browser, so without the referer below it would present
+		// no referrer where the browser presented the one its referrer policy computed, and
+		// servers protecting their resources against hotlinking refuse to serve them
+		const documentLocation = documentUrl || options.url;
+		const referer = getReferer(url, documentLocation, getDocumentReferrerPolicy(documentLocation, documentInfo, metaReferrerPolicy));
+		if (referer && !Object.keys(headers).some(name => name.toLowerCase() == REFERER_HEADER_NAME)) {
+			headers[REFERER_HEADER_NAME] = referer;
+		}
+		const response = await fetch(url, Object.assign({}, fetchOptions, { headers, signal: fetchAbortController.signal }));
+		const arrayBuffer = await response.arrayBuffer();
+		const base64Data = arrayBufferToBase64(arrayBuffer);
+		const result = {
+			status: response.status,
+			headers: Object.fromEntries(response.headers.entries()),
+			data: base64Data
+		};
+		await callBrowserFunction({ Runtime }, contextId, RESOLVE_FETCH_FUNCTION_NAME, [requestId, result], sessionId);
+	} catch (error) {
+		const errorResult = {
+			error: error.message,
+			code: error.code
+		};
+		await callBrowserFunction({ Runtime }, contextId, REJECT_FETCH_FUNCTION_NAME, [requestId, errorResult], sessionId);
+	}
+}
+
+async function callBrowserFunction({ Runtime }, contextId, functionName, args, sessionId) {
+	const serializedArgs = args.map(arg => JSON.stringify(arg)).join(", ");
+	await Runtime.evaluate({
+		expression: `globalThis.${functionName}(${serializedArgs})`,
+		contextId
+	}, sessionId);
+}
+
+async function capturePageData({ Runtime }, contextId, { options, debugMessages }) {
+	const ERROR_SUBTYPE = "error";
+	if (options.browserWaitDelay) {
+		logData([`Waiting ${options.browserWaitDelay} ms`], { options, debugMessages });
+		await new Promise(resolve => setTimeout(resolve, options.browserWaitDelay));
+	}
+	logData(["Capturing page"], { options, debugMessages });
+	const captureScript = `(${getPageDataScriptSource.toString()})(${JSON.stringify(options)},${JSON.stringify([
+		SET_SCREENSHOT_FUNCTION_NAME,
+		SET_PDF_FUNCTION_NAME,
+		SET_PAGE_DATA_FUNCTION_NAME,
+		CAPTURE_SCREENSHOT_FUNCTION_NAME,
+		PRINT_TO_PDF_FUNCTION_NAME
+	])})`;
+	const { result, exceptionDetails } = await withinCaptureMaxTime(() => Runtime.evaluate({
+		expression: captureScript,
+		awaitPromise: true,
+		returnByValue: true,
+		contextId
+	}), options);
+	// `returnByValue` serializes the rejection value to an empty object, so
+	// the error is only readable in `exceptionDetails`
+	if (exceptionDetails) {
+		const { exception, text } = exceptionDetails;
+		throw new Error(exception && exception.description ? exception.description : text);
+	}
+	if (result.subtype === ERROR_SUBTYPE) {
+		throw new Error(result.description);
+	}
+}
+
+async function withinSetupMaxTime(task, options) {
+	const SETUP_TIMEOUT_ERROR_MESSAGE = "Setup timeout: the browser did not answer within --browser-load-max-time";
+	const setupTimeoutAbortController = new AbortController();
+	const setupTimeoutAbortSignal = setupTimeoutAbortController.signal;
+	try {
+		return await Promise.race([
+			task(),
+			waitForTimeout(setupTimeoutAbortSignal, options.browserLoadMaxTime, SETUP_TIMEOUT_ERROR_MESSAGE, SETUP_TIMEOUT_ERROR)
+		]);
+	} finally {
+		if (!setupTimeoutAbortSignal.aborted) {
+			setupTimeoutAbortController.abort();
+		}
+	}
+}
+
+async function withinCaptureMaxTime(task, options) {
+	const CAPTURE_TIMEOUT_ERROR_MESSAGE = "Capture timeout";
+	const captureTimeoutAbortController = new AbortController();
+	const captureTimeoutAbortSignal = captureTimeoutAbortController.signal;
+	try {
+		return await Promise.race([
+			task(),
+			waitForTimeout(captureTimeoutAbortSignal, options.browserCaptureMaxTime, CAPTURE_TIMEOUT_ERROR_MESSAGE, CAPTURE_TIMEOUT_ERROR)
+		]);
+	} finally {
+		if (!captureTimeoutAbortSignal.aborted) {
+			captureTimeoutAbortController.abort();
+		}
+	}
+}
+
+async function disableCdpDomains({ Console, Fetch, Network, Page, Runtime }, { options }) {
+	// disabled first, so that the requests left paused are resumed by the
+	// browser instead of being held until the target is closed
+	await Fetch.disable();
+	await Runtime.disable();
+	await Page.disable();
+	if (options.httpHeaders && !hasUnsafeHttpHeaders(options)) {
+		await Network.disable();
+	}
+	if (options.consoleMessagesFile) {
+		await Console.disable();
+	}
+}
+
+async function finalizePageData(pageDataPromise, { options, consoleMessages, debugMessages, httpInfo }) {
+	const pageData = await pageDataPromise;
+	logData(["Returning page data"], { options, debugMessages });
+	if (options.consoleMessagesFile) {
+		pageData.consoleMessages = consoleMessages;
+	}
+	if (options.debugMessagesFile) {
+		pageData.debugMessages = debugMessages;
+	}
+	Object.assign(pageData, httpInfo);
+	if (options.browserWaitEndDelay) {
+		logData([`Waiting ${options.browserWaitEndDelay} ms after processing`], { options, debugMessages });
+		await new Promise(resolve => setTimeout(resolve, options.browserWaitEndDelay));
+	}
+	return pageData;
+}
+
+function attachDebugInfo(error, { options, consoleMessages, debugMessages }) {
+	if (options.consoleMessagesFile) {
+		error.consoleMessages = consoleMessages;
+	}
+	if (options.debugMessagesFile) {
+		error.debugMessages = debugMessages;
+	}
+}
+
+function ignoringErrors(listener, pageContext) {
+	return async event => {
+		try {
+			await listener(event);
+		} catch (error) {
+			// the commands sent while the target is closing are rejected, and an
+			// error thrown here would be reported as an unhandled rejection
+			logData(["Ignoring event listener error", error.message], pageContext);
+		}
+	};
+}
+
+function logData(data, { options, debugMessages }) {
+	if (options.debugMessagesFile) {
+		debugMessages.push([Date.now(), data]);
+	}
+}

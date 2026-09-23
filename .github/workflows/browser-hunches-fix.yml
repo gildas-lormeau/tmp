@@ -1,0 +1,101 @@
+name: browser-hunches-fix
+
+on:
+  push:
+    paths:
+      - .github/workflows/browser-hunches-fix.yml
+      - cli-hunch-fix/**
+  workflow_dispatch:
+
+env:
+  CLI_SHA: 000e1d540def423227c68909981c7105c29c0e4d
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: probe
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: CLI (patched)
+        run: |
+          git clone -q https://github.com/gildas-lormeau/single-file-cli.git cli
+          git -C cli checkout -q $env:CLI_SHA
+          Copy-Item probe\cli-hunch-fix\* cli\ -Recurse -Force
+          git -C cli status --short
+          deno cache cli\single-file *> $null; "deno cache exit=$LASTEXITCODE"
+          Push-Location cli; npm ci --silent *> $null; "npm ci exit=$LASTEXITCODE"; Pop-Location
+          @'
+          function Cap($name, [string[]]$cliArgs, [string]$runtime = "deno", $limit = 150) {
+            "===== $name ($runtime)"
+            Remove-Item out.html, log.txt -ErrorAction SilentlyContinue
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $job = Start-Job -ScriptBlock {
+              param($dir, $a, $runtime)
+              Set-Location $dir
+              if ($runtime -eq "node") { & node cli\single-file-node.js @a *> log.txt } else { & deno run -A cli\single-file @a *> log.txt }
+              $LASTEXITCODE
+            } -ArgumentList (Get-Location).Path, $cliArgs, $runtime
+            $seen = @{}
+            while (-not [bool](Wait-Job $job -Timeout 1)) {
+              Get-CimInstance Win32_Process -Filter "Name='chrome.exe' OR Name='msedge.exe' OR Name='brave.exe' OR Name='vivaldi.exe' OR Name='firefox.exe'" -ErrorAction SilentlyContinue | Where-Object { "$($_.CommandLine)" -match "remote-debugging-port" -and "$($_.CommandLine)" -notmatch "--type=" } | ForEach-Object {
+                $seen["$($_.Name) pid=$($_.ProcessId) single-process=$("$($_.CommandLine)" -match '--single-process') path=$($_.ExecutablePath)"] = 1
+              }
+              if ($sw.Elapsed.TotalSeconds -gt $limit) { Stop-Job $job; break }
+            }
+            $code = if ($job.State -eq "Completed") { Receive-Job $job } else { "TIMEOUT" }
+            $size = if (Test-Path out.html) { (Get-Item out.html).Length } else { "none" }
+            $warnings = if (Test-Path log.txt) { @(Select-String -Path log.txt -Pattern "retrying without it").Count } else { 0 }
+            "EXIT=$code secs=$([math]::Round($sw.Elapsed.TotalSeconds, 1)) size=$size relaunch_warnings=$warnings"
+            $seen.Keys | ForEach-Object { "  main process: $_" }
+            if (Test-Path log.txt) { Get-Content log.txt | Select-Object -Last 8 }
+            Get-Process firefox, brave, vivaldi, chrome, msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep 2
+          }
+          '@ | Set-Content cap.ps1
+      - name: Chrome and Edge keep --single-process
+        run: |
+          . .\cap.ps1
+          Cap "chrome default" @("https://example.com", "out.html")
+          Cap "edge default" @("https://example.com", "out.html", "--browser-executable-path", "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
+          exit 0
+      - name: Install MSIX Firefox, Brave and Vivaldi (per user)
+        timeout-minutes: 15
+        run: |
+          foreach ($id in "Mozilla.Firefox", "Brave.Brave", "Vivaldi.Vivaldi") {
+            $out = winget install --id $id --exact --scope user --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | Select-Object -Last 1
+            "WINGET $id exit=$LASTEXITCODE :: $out"
+          }
+          Get-AppxPackage -Name *Firefox* | ForEach-Object { "appx: $($_.Name) $($_.Version)" }
+          Get-Process brave, vivaldi, firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          exit 0
+      - name: MSIX Firefox found by the default lookup
+        run: |
+          . .\cap.ps1
+          $alias = "$env:LOCALAPPDATA\Microsoft\WindowsApps\firefox.exe"
+          "deno stat: $(deno eval "try { const s = Deno.statSync('$($alias -replace '\\', '\\')'); console.log('ok', s.isFile, s.size) } catch (e) { console.log('ERR', e.name, e.message) }")"
+          "node stat: $(node -e "try { const s = require('fs').statSync(process.argv[1]); console.log('ok', s.isFile(), s.size) } catch (e) { console.log('ERR', e.code, e.message) }" $alias)"
+          Rename-Item "C:\Program Files\Mozilla Firefox" "Mozilla Firefox.hidden" -ErrorAction Continue
+          Cap "msix default lookup" @("https://example.com", "out.html", "--browser-engine", "firefox") "deno"
+          Cap "msix default lookup" @("https://example.com", "out.html", "--browser-engine", "firefox") "node"
+          Rename-Item "C:\Program Files\Mozilla Firefox.hidden" "Mozilla Firefox" -ErrorAction Continue
+          Cap "machine-wide still first" @("https://example.com", "out.html", "--browser-engine", "firefox") "deno"
+          exit 0
+      - name: Brave and Vivaldi without --single-process
+        run: |
+          . .\cap.ps1
+          foreach ($p in "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe", "$env:LOCALAPPDATA\Vivaldi\Application\vivaldi.exe") {
+            foreach ($i in 1..2) { Cap "$(Split-Path $p -Leaf) default $i" @("https://example.com", "out.html", "--browser-executable-path", $p) }
+          }
+          Cap "brave default" @("https://example.com", "out.html", "--browser-executable-path", "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe") "node"
+          exit 0
