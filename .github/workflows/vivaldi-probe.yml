@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     defaults:
@@ -59,21 +59,17 @@ jobs:
           ls -la "$VIVALDI" "$CHROME" || true
       - name: Probe Chrome (positive control)
         timeout-minutes: 5
-        run: deno run -A vivaldi-probe/probe.ts "$CHROME" cli-headless
-      - name: Probe Vivaldi, CDP step by step
-        timeout-minutes: 25
+        run: deno run -A vivaldi-probe/probe2.ts "$CHROME" json-new-blank
+      - name: Probe Vivaldi, target creation
+        timeout-minutes: 20
         run: |
-          WRAP=""
-          if [ "$RUNNER_OS" = "Linux" ]; then WRAP="xvfb-run -a"; fi
-          for variant in cli-headless cli-headless-single cli-headless-no-bwsi cli-headless-no-startup-window-kept cli-headless-useragent minimal-headless; do
-            deno run -A vivaldi-probe/probe.ts "$VIVALDI" "$variant"
-          done
-          for variant in cli-headful cli-headful-single; do
-            $WRAP deno run -A vivaldi-probe/probe.ts "$VIVALDI" "$variant"
+          for strategy in json-new-blank json-new-nourl json-new-data json-new-blank-wait json-new-blank-navigate-blank json-new-blank-activate target-create target-create-window target-create-foreground; do
+            deno run -A vivaldi-probe/probe2.ts "$VIVALDI" "$strategy"
           done
       - name: CLI with Vivaldi
         timeout-minutes: 10
         run: |
+          set +e
           WRAP=""
           if [ "$RUNNER_OS" = "Linux" ]; then WRAP="xvfb-run -a"; fi
           run_cli() {
