@@ -260,7 +260,9 @@ async function setupDeviceMetrics({ Emulation, Runtime }, { options, debugMessag
 
 async function setupUserAgent({ Browser, Emulation }, { options, debugMessages }, sessionId) {
 	const ANDROID_PLATFORM = "Android";
+	console.error("DIAG before Browser.getVersion at " + Date.now());
 	const { userAgent, product } = await Browser.getVersion();
+	console.error("DIAG after Browser.getVersion at " + Date.now() + " userAgent=" + userAgent + " product=" + product);
 	const defaultMobileUA = `Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) ${removeHeadlessToken(product)} Mobile Safari/537.36`;
 	const agentOptions = {
 		userAgent: options.userAgent || (options.browserMobileEmulation ? defaultMobileUA : removeHeadlessToken(userAgent))
@@ -273,7 +275,9 @@ async function setupUserAgent({ Browser, Emulation }, { options, debugMessages }
 	}
 	if (needsUserAgentOverride(options) || agentOptions.userAgent !== userAgent) {
 		logData(["Emulating user agent", JSON.stringify(agentOptions)], { options, debugMessages });
+		console.error("DIAG before setUserAgentOverride " + JSON.stringify(agentOptions) + " at " + Date.now());
 		await Emulation.setUserAgentOverride(agentOptions, sessionId);
+		console.error("DIAG after setUserAgentOverride at " + Date.now());
 	}
 	return agentOptions.userAgent;
 }
