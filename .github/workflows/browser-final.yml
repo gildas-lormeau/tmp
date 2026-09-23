@@ -1,0 +1,114 @@
+name: browser-final
+
+on:
+  push:
+    paths:
+      - .github/workflows/browser-final.yml
+      - cli-final/**
+  workflow_dispatch:
+
+env:
+  CLI_VERSION: v2.15.6
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: CLI copies (diag = fix + stage logs, exp2 = diag + browser.close + wait before kill)
+        run: |
+          git clone -q --depth 1 --branch "$env:CLI_VERSION" https://github.com/gildas-lormeau/single-file-cli.git cli
+          Copy-Item cli-final\*.js cli\lib\ -Force
+          git -C cli status --short
+          deno cache cli\single-file *> $null; "cache exit=$LASTEXITCODE"
+      - name: Define monitor
+        run: |
+          @'
+          function Get-Browsers([string[]]$names) {
+            foreach ($n in $names) {
+              Get-CimInstance Win32_Process -Filter "Name='$n'" -ErrorAction SilentlyContinue | ForEach-Object {
+                $cl = "$($_.CommandLine)"
+                $port = if ($cl -match '--remote-debugging-port=(\d+)') { $Matches[1] } else { "" }
+                $type = if ($cl -match '--type=([\w-]+)') { $Matches[1] } elseif ($cl -match '-contentproc') { "contentproc" } else { "main" }
+                [pscustomobject]@{ Name = $n; Pid = $_.ProcessId; Parent = $_.ParentProcessId; Type = $type; Port = $port; Headless = ($cl -match '--headless'); Profile = ($cl -match 'Temp') }
+              }
+            }
+          }
+          function Run-Diag($name, $cliDir, [string[]]$extra, [string[]]$procNames, $limit = 120) {
+            "===== $name"
+            Remove-Item out.html, log.txt, dbg.txt -ErrorAction SilentlyContinue
+            $tempBefore = @(Get-ChildItem $env:TEMP -Directory | ForEach-Object FullName)
+            $start = Get-Date
+            $job = Start-Job -ScriptBlock { param($dir, $cliDir, $extra) Set-Location $dir; & deno run -A "$cliDir\single-file" https://example.com out.html @extra *> log.txt; $LASTEXITCODE } -ArgumentList (Get-Location).Path, $cliDir, $extra
+            $done = $false
+            while (-not $done) {
+              $done = [bool](Wait-Job $job -Timeout 3)
+              $t = [int]((Get-Date) - $start).TotalSeconds
+              $procs = @(Get-Browsers $procNames)
+              $summary = ($procs | ForEach-Object { "$($_.Pid)<$($_.Parent) $($_.Type)$(if ($_.Port) { ' port=' + $_.Port })$(if ($_.Headless) { ' headless' })" }) -join "; "
+              $portInfo = ""
+              $mainPort = ($procs | Where-Object { $_.Port } | Select-Object -First 1).Port
+              if ($mainPort) {
+                try { $v = Invoke-RestMethod "http://127.0.0.1:$mainPort/json/version" -TimeoutSec 2; $portInfo = " json/version=$($v.Browser)" } catch { $portInfo = " json/version=ERR" }
+                try { $l = Invoke-RestMethod "http://127.0.0.1:$mainPort/json/list" -TimeoutSec 2; $portInfo += " targets=[" + (($l | ForEach-Object { "$($_.type):$($_.url.Substring(0, [Math]::Min(60, $_.url.Length)))" }) -join ' | ') + "]" } catch { }
+              }
+              "t=${t}s procs=$($procs.Count) [$summary]$portInfo"
+              if (-not $done -and $t -ge $limit) { "LIMIT reached"; Stop-Job $job; break }
+            }
+            $code = if ($done) { Receive-Job $job } else { "TIMEOUT" }
+            "EXIT=$code size=$(if (Test-Path out.html) { (Get-Item out.html).Length } else { 'none' })"
+            "--- log"; if (Test-Path log.txt) { Get-Content log.txt }
+            "--- debug messages (last 40)"; if (Test-Path dbg.txt) { Get-Content dbg.txt | Select-Object -Last 40 }
+            $left = @(Get-Browsers $procNames)
+            "--- leftover processes right after exit: $($left.Count) [$(($left | ForEach-Object { "$($_.Pid) $($_.Type)" }) -join '; ')]"
+            $newDirs = @(Get-ChildItem $env:TEMP -Directory | Where-Object { $tempBefore -notcontains $_.FullName })
+            "--- new temp dirs: $($newDirs.Count)"
+            foreach ($d in $newDirs) {
+              $files = @(Get-ChildItem $d.FullName -Recurse -File -ErrorAction SilentlyContinue)
+              "  $($d.Name) files=$($files.Count) sample=$(($files | Select-Object -First 5 | ForEach-Object { $_.FullName.Substring($d.FullName.Length) }) -join ', ')"
+            }
+            Start-Sleep 5
+            $left = @(Get-Browsers $procNames)
+            "--- leftover processes after 5s: $($left.Count)"
+            foreach ($d in $newDirs) { try { Remove-Item $d.FullName -Recurse -Force -ErrorAction Stop; "  removed $($d.Name) after 5s" } catch { "  still locked $($d.Name) after 5s :: $($_.Exception.Message)" } }
+            Get-Process ($procNames | ForEach-Object { $_ -replace '\.exe$', '' }) -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+          '@ | Set-Content monitor.ps1
+      - name: F1 - Firefox
+        run: |
+          . .\monitor.ps1
+          Run-Diag "firefox 1" "cli" @("--browser-engine", "firefox") @("firefox.exe")
+          exit 0
+      - name: F2 - Firefox
+        run: |
+          . .\monitor.ps1
+          Run-Diag "firefox 2" "cli" @("--browser-engine", "firefox") @("firefox.exe")
+          exit 0
+      - name: F3 - Firefox
+        run: |
+          . .\monitor.ps1
+          Run-Diag "firefox 3" "cli" @("--browser-engine", "firefox") @("firefox.exe")
+          exit 0
+      - name: C - Chrome
+        run: |
+          . .\monitor.ps1
+          Run-Diag "chrome" "cli" @() @("chrome.exe")
+          exit 0
+      - name: Install Vivaldi
+        timeout-minutes: 10
+        run: |
+          $out = winget install --id Vivaldi.Vivaldi --exact --scope user --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | Select-Object -Last 1
+          "WINGET exit=$LASTEXITCODE :: $out"
+          exit 0
+      - name: V - Vivaldi, default load limit
+        run: |
+          . .\monitor.ps1
+          Run-Diag "vivaldi" "cli" @("--browser-executable-path", "$env:LOCALAPPDATA\Vivaldi\Application\vivaldi.exe") @("vivaldi.exe")
+          exit 0
