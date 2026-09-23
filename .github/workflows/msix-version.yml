@@ -6,28 +6,52 @@ on:
       - .github/workflows/msix-version.yml
   workflow_dispatch:
 
+env:
+  CLI_SHA: fc0ac657cdf7c90d8bb309c112c8506c4d8c4688
+
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     defaults:
       run:
         shell: pwsh
     steps:
-      - name: Install MSIX Firefox (per user) and read its version
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: CLI
+        run: |
+          git clone -q https://github.com/gildas-lormeau/single-file-cli.git cli
+          git -C cli checkout -q $env:CLI_SHA
+          git -C cli log --oneline -1
+          deno cache cli\single-file *> $null; "deno cache exit=$LASTEXITCODE"
+      - name: Install Mozilla.Firefox.MSIX and read its version
         timeout-minutes: 12
         run: |
           [Console]::OutputEncoding = [Text.UTF8Encoding]::new()
-          $out = winget install --id Mozilla.Firefox --exact --scope user --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | Select-Object -Last 1
+          winget show --id Mozilla.Firefox.MSIX --exact --accept-source-agreements 2>&1 | Select-String -Pattern "^Version|Installer Type|Scope"
+          $out = winget install --id Mozilla.Firefox.MSIX --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | Select-Object -Last 1
           "WINGET exit=$LASTEXITCODE :: $out"
-          winget show --id Mozilla.Firefox --exact --scope user 2>&1 | Select-String -Pattern "Version|Installer Type|Installer Url"
           $pkg = Get-AppxPackage -Name *Firefox* | Select-Object -First 1
-          "appx: $($pkg.Name) $($pkg.Version)"
+          "appx: $($pkg.Name) $($pkg.Version) family=$($pkg.PackageFamilyName)"
           $exe = (Get-ChildItem $pkg.InstallLocation -Recurse -Filter firefox.exe -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
           "file version: $((Get-Item $exe).VersionInfo.ProductVersion)"
           Get-Content (Join-Path (Split-Path $exe) "application.ini") | Select-String "^Version|^BuildID"
           $alias = "$env:LOCALAPPDATA\Microsoft\WindowsApps\firefox.exe"
+          "alias exists: $(Test-Path $alias)"
           "alias --version: $(& $alias --version 2>&1 | Out-String)"
-          "---- upgrade available?"
-          winget upgrade --id Mozilla.Firefox --exact --accept-source-agreements 2>&1 | Select-Object -Last 3
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          exit 0
+      - name: Save a page with it through the default lookup
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Rename-Item "C:\Program Files\Mozilla Firefox" "Mozilla Firefox.hidden" -ErrorAction Continue
+          "machine-wide hidden: $(-not (Test-Path 'C:\Program Files\Mozilla Firefox\firefox.exe'))"
+          Remove-Item out.html -ErrorAction SilentlyContinue
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          & deno run -A cli\single-file https://example.com out.html --browser-engine firefox *> log.txt
+          "EXIT=$LASTEXITCODE secs=$([math]::Round($sw.Elapsed.TotalSeconds, 1)) size=$(if (Test-Path out.html) { (Get-Item out.html).Length } else { 'none' })"
+          Get-Content log.txt | Select-Object -Last 5
+          Rename-Item "C:\Program Files\Mozilla Firefox.hidden" "Mozilla Firefox" -ErrorAction Continue
           exit 0
